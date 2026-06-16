@@ -1,0 +1,14 @@
+# Gradle cache and build outputs
+.gradle/
+build/
+app/build/
+
+# Local Android SDK config
+local.properties
+
+# IDE files
+.idea/
+*.iml
+
+# OS
+.DS_Store
