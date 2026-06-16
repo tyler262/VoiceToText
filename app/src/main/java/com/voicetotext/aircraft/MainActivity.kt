@@ -61,6 +61,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun loadSettings() {
         val prefs = Prefs.get(this)
+        binding.etServerUrl.setText(prefs.getString(Prefs.KEY_SERVER_URL, Prefs.DEFAULT_SERVER_URL))
         binding.etSsid.setText(prefs.getString(Prefs.KEY_SSID, ""))
         binding.etMulticastIp.setText(prefs.getString(Prefs.KEY_MULTICAST_IP, Prefs.DEFAULT_IP))
         binding.etPort.setText(prefs.getInt(Prefs.KEY_MULTICAST_PORT, Prefs.DEFAULT_PORT).toString())
@@ -68,12 +69,15 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun saveSettings() {
+        val serverUrl = binding.etServerUrl.text?.toString()?.trim()
+            .takeUnless { it.isNullOrBlank() } ?: Prefs.DEFAULT_SERVER_URL
         val ssid = binding.etSsid.text?.toString()?.trim() ?: ""
         val ip = binding.etMulticastIp.text?.toString()?.trim()
             .takeUnless { it.isNullOrBlank() } ?: Prefs.DEFAULT_IP
         val port = binding.etPort.text?.toString()?.trim()?.toIntOrNull() ?: Prefs.DEFAULT_PORT
 
         Prefs.get(this).edit()
+            .putString(Prefs.KEY_SERVER_URL, serverUrl)
             .putString(Prefs.KEY_SSID, ssid)
             .putString(Prefs.KEY_MULTICAST_IP, ip)
             .putInt(Prefs.KEY_MULTICAST_PORT, port)

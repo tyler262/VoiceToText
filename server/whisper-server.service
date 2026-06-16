@@ -1,0 +1,34 @@
+[Unit]
+Description=Whisper Voice Transcription Server
+Documentation=https://github.com/tyler262/VoiceToText
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=whisper
+Group=whisper
+WorkingDirectory=/opt/whisper-server
+ExecStart=/opt/whisper-server/venv/bin/python /opt/whisper-server/server.py
+Restart=on-failure
+RestartSec=5
+
+# Model / device settings — edit these to change model size or use GPU
+Environment="WHISPER_MODEL=small.en"
+Environment="WHISPER_DEVICE=cpu"
+Environment="WHISPER_COMPUTE=int8"
+Environment="WHISPER_PORT=8765"
+Environment="WHISPER_HOST=0.0.0.0"
+
+# The model cache lives here so it survives restarts
+Environment="HF_HOME=/opt/whisper-server/.cache"
+
+# Prevent the process from being killed by OOM killer
+OOMScoreAdjust=-500
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=whisper-server
+
+[Install]
+WantedBy=multi-user.target

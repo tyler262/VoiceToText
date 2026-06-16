@@ -7,13 +7,9 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
 import android.graphics.PixelFormat
-import android.os.Bundle
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
-import android.speech.RecognitionListener
-import android.speech.RecognizerIntent
-import android.speech.SpeechRecognizer
 import android.view.Gravity
 import android.view.LayoutInflater
 import android.view.MotionEvent
@@ -26,21 +22,22 @@ import kotlin.math.abs
 
 class FloatingButtonService : Service() {
 
-    private lateinit var windowManager: WindowManager
-    private lateinit var floatingView: View
-    private lateinit var speechRecognizer: SpeechRecognizer
-    private lateinit var wifiMonitor: WifiMonitor
-    private val mainHandler = Handler(Looper.getMainLooper())
-    private var isListening = false
-    private var buttonVisible = false
-
-    // Exposed so external apps can force the button regardless of WiFi
     companion object {
         const val ACTION_SHOW_BUTTON = "com.voicetotext.aircraft.ACTION_SHOW_BUTTON"
         const val ACTION_STOP = "com.voicetotext.aircraft.ACTION_STOP"
         private const val CHANNEL_ID = "voice_cmd_service"
         private const val NOTIF_ID = 1001
+        private const val MAX_RECORD_MS = 45_000L   // safety cut-off
     }
+
+    private lateinit var windowManager: WindowManager
+    private lateinit var floatingView: View
+    private lateinit var wifiMonitor: WifiMonitor
+    private val whisperClient = WhisperClient()
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    private var isRecording = false
+    private var buttonVisible = false
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -48,13 +45,12 @@ class FloatingButtonService : Service() {
         super.onCreate()
         windowManager = getSystemService(WindowManager::class.java)
         startForeground(NOTIF_ID, buildNotification())
-        setupSpeechRecognizer()
         startWifiMonitoring()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
-            ACTION_SHOW_BUTTON -> showButton()   // External app: force-show
+            ACTION_SHOW_BUTTON -> showButton()
             ACTION_STOP -> stopSelf()
         }
         return START_STICKY
@@ -64,23 +60,18 @@ class FloatingButtonService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
-        wifiMonitor.stop()
-        if (::speechRecognizer.isInitialized) speechRecognizer.destroy()
-        if (buttonVisible && ::floatingView.isInitialized) {
-            windowManager.removeView(floatingView)
-        }
+        if (isRecording) whisperClient.cancel()
+        if (::wifiMonitor.isInitialized) wifiMonitor.stop()
+        if (buttonVisible && ::floatingView.isInitialized) windowManager.removeView(floatingView)
     }
 
     // ── WiFi monitoring ───────────────────────────────────────────────────────
 
     private fun startWifiMonitoring() {
-        val prefs = Prefs.get(this)
-        val targetSsid = prefs.getString(Prefs.KEY_SSID, "")?.trim() ?: ""
-
+        val targetSsid = Prefs.get(this).getString(Prefs.KEY_SSID, "")?.trim() ?: ""
         wifiMonitor = WifiMonitor(this)
 
         if (targetSsid.isEmpty()) {
-            // No SSID configured — always show button
             showButton()
             return
         }
@@ -103,8 +94,7 @@ class FloatingButtonService : Service() {
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = 16
-            y = 200
+            x = 16; y = 200
         }
 
         floatingView = LayoutInflater.from(this).inflate(R.layout.floating_button_layout, null)
@@ -115,6 +105,7 @@ class FloatingButtonService : Service() {
 
     private fun hideButton() {
         if (!buttonVisible || !::floatingView.isInitialized) return
+        if (isRecording) { whisperClient.cancel(); isRecording = false }
         windowManager.removeView(floatingView)
         buttonVisible = false
     }
@@ -130,117 +121,99 @@ class FloatingButtonService : Service() {
                 MotionEvent.ACTION_DOWN -> {
                     startX = params.x; startY = params.y
                     touchX = event.rawX; touchY = event.rawY
-                    dragged = false
-                    true
+                    dragged = false; true
                 }
                 MotionEvent.ACTION_MOVE -> {
                     val dx = (event.rawX - touchX).toInt()
                     val dy = (event.rawY - touchY).toInt()
                     if (abs(dx) > 8 || abs(dy) > 8) dragged = true
                     if (dragged) {
-                        params.x = startX + dx
-                        params.y = startY + dy
+                        params.x = startX + dx; params.y = startY + dy
                         windowManager.updateViewLayout(floatingView, params)
                     }
                     true
                 }
-                MotionEvent.ACTION_UP -> {
-                    if (!dragged) toggleListening()
-                    true
-                }
+                MotionEvent.ACTION_UP -> { if (!dragged) toggleRecording(); true }
                 else -> false
             }
         }
     }
 
-    // ── Speech recognition ────────────────────────────────────────────────────
+    // ── Recording / transcription ─────────────────────────────────────────────
 
-    private fun setupSpeechRecognizer() {
-        speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this)
-        speechRecognizer.setRecognitionListener(object : RecognitionListener {
-            override fun onReadyForSpeech(p: Bundle?) = setListening(true)
-            override fun onBeginningOfSpeech() {}
-            override fun onEndOfSpeech() {}
-            override fun onRmsChanged(v: Float) {}
-            override fun onBufferReceived(b: ByteArray?) {}
-            override fun onPartialResults(r: Bundle?) {}
-            override fun onEvent(t: Int, p: Bundle?) {}
+    private fun toggleRecording() {
+        if (isRecording) {
+            commitRecording()
+        } else {
+            startRecording()
+        }
+    }
 
-            override fun onResults(results: Bundle?) {
-                val text = results
-                    ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                    ?.firstOrNull() ?: return
-                handleVoiceResult(text)
-            }
+    private fun startRecording() {
+        isRecording = true
+        setButtonActive(true)
+        showStatus("Recording… tap to send")
+        whisperClient.startRecording()
 
-            override fun onError(error: Int) {
-                setListening(false)
-                showStatus(errorLabel(error))
-                autoHideStatus(3000)
+        // Safety cut-off
+        mainHandler.postDelayed({
+            if (isRecording) commitRecording()
+        }, MAX_RECORD_MS)
+    }
+
+    private fun commitRecording() {
+        isRecording = false
+        setButtonActive(false)
+        showStatus("Transcribing…")
+
+        val prefs = Prefs.get(this)
+        val url = prefs.getString(Prefs.KEY_SERVER_URL, Prefs.DEFAULT_SERVER_URL) ?: Prefs.DEFAULT_SERVER_URL
+
+        whisperClient.stopAndTranscribe(url, object : WhisperClient.Callback {
+            override fun onResult(text: String) = mainHandler.post { handleResult(text) }
+            override fun onError(msg: String) = mainHandler.post {
+                showStatus("Error: $msg")
+                autoHideStatus(5000)
             }
         })
     }
 
-    private fun toggleListening() {
-        if (!::speechRecognizer.isInitialized) return
-        if (isListening) {
-            speechRecognizer.stopListening()
-            setListening(false)
-        } else {
-            val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-                putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-                putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
-                putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, false)
-            }
-            speechRecognizer.startListening(intent)
-            showStatus("Listening…")
-        }
-    }
-
-    private fun handleVoiceResult(text: String) {
-        setListening(false)
+    private fun handleResult(text: String) {
         showStatus(text)
-
         val prefs = Prefs.get(this)
-        val ip = prefs.getString(Prefs.KEY_MULTICAST_IP, Prefs.DEFAULT_IP) ?: Prefs.DEFAULT_IP
+        val ip   = prefs.getString(Prefs.KEY_MULTICAST_IP, Prefs.DEFAULT_IP) ?: Prefs.DEFAULT_IP
         val port = prefs.getInt(Prefs.KEY_MULTICAST_PORT, Prefs.DEFAULT_PORT)
-
         UdpMulticastSender.send(this, CommandFormatter.format(text), ip, port)
-        autoHideStatus(4000)
+        autoHideStatus(5000)
     }
 
     // ── UI helpers ────────────────────────────────────────────────────────────
 
-    private fun setListening(listening: Boolean) {
-        isListening = listening
+    private fun setButtonActive(active: Boolean) {
         if (!buttonVisible || !::floatingView.isInitialized) return
-        val btn = floatingView.findViewById<ImageButton>(R.id.btn_mic)
-        btn.setBackgroundResource(
-            if (listening) R.drawable.mic_button_active_bg else R.drawable.mic_button_bg
+        floatingView.findViewById<ImageButton>(R.id.btn_mic).setBackgroundResource(
+            if (active) R.drawable.mic_button_active_bg else R.drawable.mic_button_bg
         )
     }
 
     private fun showStatus(text: String) {
         if (!buttonVisible || !::floatingView.isInitialized) return
         floatingView.findViewById<TextView>(R.id.tv_status).apply {
-            this.text = text
-            visibility = View.VISIBLE
+            this.text = text; visibility = View.VISIBLE
         }
     }
 
     private fun autoHideStatus(delayMs: Long) {
         mainHandler.postDelayed({
-            if (buttonVisible && ::floatingView.isInitialized) {
+            if (buttonVisible && ::floatingView.isInitialized)
                 floatingView.findViewById<TextView>(R.id.tv_status).visibility = View.GONE
-            }
         }, delayMs)
     }
 
     // ── Notification ──────────────────────────────────────────────────────────
 
     private fun buildNotification(): Notification {
-        val nm = getSystemService(NotificationManager::class.java)
-        nm.createNotificationChannel(
+        getSystemService(NotificationManager::class.java).createNotificationChannel(
             NotificationChannel(CHANNEL_ID, "Voice Command Overlay", NotificationManager.IMPORTANCE_LOW)
         )
         val stopPi = PendingIntent.getService(
@@ -249,28 +222,15 @@ class FloatingButtonService : Service() {
             PendingIntent.FLAG_IMMUTABLE
         )
         val openPi = PendingIntent.getActivity(
-            this, 0,
-            Intent(this, MainActivity::class.java),
-            PendingIntent.FLAG_IMMUTABLE
+            this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
         )
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Voice Command Active")
-            .setContentText("Tap the mic button to issue a command")
+            .setContentText("Tap mic · speak · tap again to send")
             .setSmallIcon(R.drawable.ic_mic_notif)
             .setContentIntent(openPi)
             .addAction(0, "Stop", stopPi)
             .setOngoing(true)
             .build()
-    }
-
-    private fun errorLabel(code: Int) = when (code) {
-        SpeechRecognizer.ERROR_AUDIO -> "Audio error"
-        SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "Mic permission denied"
-        SpeechRecognizer.ERROR_NETWORK, SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "Network error"
-        SpeechRecognizer.ERROR_NO_MATCH -> "No speech detected"
-        SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "Recognizer busy"
-        SpeechRecognizer.ERROR_SERVER -> "Server error"
-        SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "Timeout — try again"
-        else -> "Error ($code)"
     }
 }
